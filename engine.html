@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rules engine</title>
+<style>
+  :root {
+    --bg:   #12100e;
+    --ink:  #e8e2d6;
+    --dim:  #8a8177;
+    --line: #2e2925;
+    --ok:   #7fb069;
+    --bad:  #c96f5a;
+    --gold: #c9a227;
+    --mp:   #5f8fb0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 1.5rem 1.25rem 3rem;
+    background: var(--bg); color: var(--ink);
+    font: 15px/1.6 ui-monospace, "Cascadia Code", Consolas, monospace;
+  }
+  main { max-width: 44rem; margin: 0 auto; }
+  h1 { font-size: .8rem; font-weight: 500; letter-spacing: .14em;
+       text-transform: uppercase; color: var(--dim); margin: 0 0 1.25rem; }
+
+  /* ---- stat block ---- */
+  .sheet { border: 1px solid var(--line); padding: .9rem 1rem; margin-bottom: 1rem; }
+  .row { display: flex; gap: 1.25rem; flex-wrap: wrap; }
+  .row + .row { margin-top: .5rem; }
+  .stat { white-space: nowrap; }
+  .label { color: var(--dim); }
+  .hp { color: var(--ok); }
+  .hp.low { color: var(--bad); }
+  .mp { color: var(--mp); }
+  .ap { color: var(--ink); }
+  .gold { color: var(--gold); }
+  .none { color: var(--dim); }
+  .buff { color: var(--ok); }
+  .debuff { color: var(--bad); }
+
+  /* ---- log ---- */
+  #log {
+    border: 1px solid var(--line); padding: .9rem 1rem;
+    height: 20rem; overflow-y: auto; margin-bottom: 1rem;
+  }
+  #log p { margin: 0 0 .5rem; }
+  #log p:last-child { margin-bottom: 0; }
+  .sys  { color: var(--dim); }
+  .hurt { color: var(--bad); }
+  .good { color: var(--ok); }
+  .beat { color: var(--dim); border-top: 1px solid var(--line);
+          margin-top: .9rem; padding-top: .6rem; }
+
+  /* ---- actions ---- */
+  .actions { display: flex; gap: .5rem; flex-wrap: wrap; }
+  button {
+    font: inherit; color: var(--bg); background: var(--ink);
+    border: 0; padding: .5rem .95rem; cursor: pointer;
+  }
+  button:disabled { background: var(--line); color: var(--dim); cursor: default; }
+  button:focus-visible { outline: 2px solid var(--ok); outline-offset: 2px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Rules engine &mdash; no AI attached</h1>
+
+  <div class="sheet" id="sheet"></div>
+  <div id="log"></div>
+  <div class="actions" id="actions"></div>
+</main>
+
+<script type="module">
+
+/* ==========================================================
+   1. CONTENT TABLES
+   Static definitions. Nothing here changes during play.
+   ========================================================== */
+
+const WEAPONS = {
+  rusted_blade: { name: "Rusted Blade", min: 1, max: 6, bonus: 2 }
+};
+
+const SPELLS = {
+  ember: {
+    name: "Ember", cost: 3, min: 3, max: 7,
+    piercing: true,                    // ignores AP entirely
+    blurb: "a gout of flame that armor does nothing against"
+  }
+};
+
+const ITEMS = {
+  bandage:   { name: "Bandage",    price: 5,  effect: "heal 6 HP" },
+  ether:     { name: "Ether Vial", price: 8,  effect: "restore 5 MP" },
+  whetstone: { name: "Whetstone",  price: 10, effect: "+2 damage for 3 turns" },
+  antidote:  { name: "Antidote",   price: 6,  effect: "clear all debuffs" },
+  plating:   { name: "Scrap Plate", price: 12, effect: "restore 4 AP" }
+};
+
+const SHOP = ["bandage", "ether", "whetstone", "antidote", "plating"];
+
+/* ==========================================================
+   2. LIVE STATE
+   Everything that changes. This whole object is your save file.
+   ========================================================== */
+
+let state = {
+  hp: 20, maxHp: 20,
+  mp: 10, maxMp: 10,
+  ap:  5, maxAp:  5,
+  gold: 20,
+  buffs:   [],                         // { name, turns, note }
+  debuffs: [],
+  inventory: { bandage: 2, ether: 1 }, // itemId -> quantity
+  equipped: { weapon: "rusted_blade" },
+  knownSpells: ["ember"]
+};
+
+let enemy = {
+  name: "Gaunt Figure",
+  hp: 18, maxHp: 18,
+  ap: 2,
+  min: 1, max: 5,
+  mood: 3,                             // hits 0 and it disengages
+  gold: 9
+};
+
+let inCombat = true;
+let over = false;
+
+/* ==========================================================
+   3. HELPERS
+   ========================================================== */
+
+const roll  = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+
+function log(text, cls = "") {
+  const box = document.getElementById("log");
+  const p = document.createElement("p");
+  if (cls) p.className = cls;
+  p.textContent = text;
+  box.appendChild(p);
+  box.scrollTop = box.scrollHeight;
+}
+
+function addStatus(list, name, turns, note) {
+  const existing = list.find(s => s.name === name);
+  if (existing) existing.turns = Math.max(existing.turns, turns);
+  else list.push({ name, turns, note });
+}
+
+const hasStatus = (list, name) => list.some(s => s.name === name);
+
+/* ---- the one damage function everything routes through ----
+   AP is a shield pool: it soaks first, then the rest hits HP.
+   Swap this out and the whole combat feel changes.            */
+function dealDamage(target, amount, piercing = false) {
+  if (piercing) {
+    target.hp = clamp(target.hp - amount, 0, target.maxHp ?? 999);
+    return { absorbed: 0, through: amount };
+  }
+  const absorbed = Math.min(target.ap, amount);
+  target.ap -= absorbed;
+  const through = amount - absorbed;
+  target.hp = clamp(target.hp - through, 0, target.maxHp ?? 999);
+  return { absorbed, through };
+}
+
+function damageReport(who, res) {
+  if (res.absorbed && res.through) {
+    return `${who} takes ${res.through}. Armor ate ${res.absorbed}.`;
+  }
+  if (res.absorbed && !res.through) {
+    return `${who}'s armor absorbs all ${res.absorbed}.`;
+  }
+  return `${who} takes ${res.through}.`;
+}
+
+/* ==========================================================
+   4. TURN CYCLE
+   Every action except Look ends with this. Statuses tick,
+   then the enemy gets to act. That is what makes Rest risky.
+   ========================================================== */
+
+function endTurn() {
+  if (over) return;
+
+  // Debuffs bite before they expire
+  for (const d of state.debuffs) {
+    if (d.name === "Bleeding") {
+      state.hp = clamp(state.hp - 2, 0, state.maxHp);
+      log("Bleeding costs you 2 HP.", "hurt");
+    }
+  }
+
+  tickDown(state.buffs);
+  tickDown(state.debuffs);
+
+  if (inCombat && enemy.hp > 0) enemyTurn();
+
+  checkEnd();
+  render();
+}
+
+function tickDown(list) {
+  for (let i = list.length - 1; i >= 0; i--) {
+    list[i].turns--;
+    if (list[i].turns <= 0) {
+      log(`${list[i].name} wears off.`, "sys");
+      list.splice(i, 1);
+    }
+  }
+}
+
+function enemyTurn() {
+  let dmg = roll(enemy.min, enemy.max);
+  if (hasStatus(state.buffs, "Guarded")) dmg = Math.max(0, dmg - 2);
+
+  const res = dealDamage(state, dmg);
+  log(`${enemy.name} strikes for ${dmg}. ` + damageReport("You", res), "hurt");
+
+  // Occasionally it opens a wound
+  if (res.through >= 4 && roll(1, 4) === 1) {
+    addStatus(state.debuffs, "Bleeding", 3, "2 HP per turn");
+    log("The wound will not close. Bleeding, 3 turns.", "hurt");
+  }
+}
+
+function checkEnd() {
+  if (state.hp <= 0) {
+    over = true;
+    log("You go down. Run ends here.", "beat");
+  } else if (inCombat && enemy.hp <= 0) {
+    inCombat = false;
+    state.gold += enemy.gold;
+    log(`${enemy.name} folds. You take ${enemy.gold} gold.`, "beat");
+  }
+}
+
+/* ==========================================================
+   5. ACTIONS
+   Each one returns nothing. They log, mutate state, end turn.
+   ========================================================== */
+
+const actions = {
+
+  fight() {
+    const w = WEAPONS[state.equipped.weapon];
+    let dmg = roll(w.min, w.max) + w.bonus;
+    if (hasStatus(state.buffs, "Sharpened")) dmg += 2;
+
+    const res = dealDamage(enemy, dmg);
+    log(`You swing the ${w.name} for ${dmg}. ` + damageReport(enemy.name, res));
+    endTurn();
+  },
+
+  cast() {
+    const s = SPELLS.ember;
+    if (state.mp < s.cost) { log("Not enough MP.", "sys"); return; }
+
+    state.mp -= s.cost;
+    const dmg = roll(s.min, s.max);
+    const res = dealDamage(enemy, dmg, s.piercing);
+    log(`You cast ${s.name} for ${dmg}, straight past armor. ` +
+        damageReport(enemy.name, res));
+    endTurn();
+  },
+
+  talk() {
+    const persuasion = roll(1, 3);
+    enemy.mood -= persuasion;
+    log(`You try to talk it down. It loses ${persuasion} of its nerve.`);
+
+    if (enemy.mood <= 0) {
+      inCombat = false;
+      log(`${enemy.name} lowers its guard and backs away. No loot.`, "beat");
+      render();
+      return;
+    }
+    endTurn();
+  },
+
+  use(itemId) {
+    if (!state.inventory[itemId]) { log("You don't have that.", "sys"); return; }
+    state.inventory[itemId]--;
+    if (state.inventory[itemId] <= 0) delete state.inventory[itemId];
+
+    const item = ITEMS[itemId];
+    switch (itemId) {
+      case "bandage":
+        state.hp = clamp(state.hp + 6, 0, state.maxHp);
+        log("You bind the wound. +6 HP.", "good"); break;
+      case "ether":
+        state.mp = clamp(state.mp + 5, 0, state.maxMp);
+        log("The vial burns going down. +5 MP.", "good"); break;
+      case "whetstone":
+        addStatus(state.buffs, "Sharpened", 3, "+2 damage");
+        log("You work the edge back. Sharpened, 3 turns.", "good"); break;
+      case "antidote":
+        state.debuffs.length = 0;
+        log("Debuffs cleared.", "good"); break;
+      case "plating":
+        state.ap = clamp(state.ap + 4, 0, state.maxAp);
+        log("You strap the plate on. +4 AP.", "good"); break;
+      default:
+        log(`${item.name} does nothing yet.`, "sys");
+    }
+    endTurn();
+  },
+
+  rest() {
+    state.hp = clamp(state.hp + 4, 0, state.maxHp);
+    state.mp = clamp(state.mp + 3, 0, state.maxMp);
+    addStatus(state.buffs, "Guarded", 1, "-2 incoming damage");
+    log("You catch your breath. +4 HP, +3 MP, guard up.", "good");
+    endTurn();                          // enemy still gets to hit you
+  },
+
+  look() {
+    log("— " + enemy.name + ": " + enemy.hp + "/" + enemy.maxHp +
+        " HP, " + enemy.ap + " AP, nerve " + Math.max(0, enemy.mood), "sys");
+    log("Costs no turn.", "sys");
+    render();                            // deliberately no endTurn()
+  },
+
+  trade() {
+    const id = SHOP[roll(0, SHOP.length - 1)];
+    const item = ITEMS[id];
+    if (state.gold < item.price) {
+      log(`A pedlar offers a ${item.name} for ${item.price}g. You can't afford it.`, "sys");
+      return;
+    }
+    state.gold -= item.price;
+    state.inventory[id] = (state.inventory[id] || 0) + 1;
+    log(`Bought a ${item.name} for ${item.price}g. (${item.effect})`, "good");
+    render();
+  },
+
+  leave() {
+    if (roll(1, 6) >= 3) {
+      inCombat = false;
+      log("You break away and put distance between you.", "beat");
+      render();
+    } else {
+      log("It cuts you off before you can turn.", "hurt");
+      endTurn();
+    }
+  }
+};
+
+/* ==========================================================
+   6. RENDER
+   Pure display. Reads state, writes DOM, changes nothing.
+   ========================================================== */
+
+function statusText(list, cls) {
+  if (!list.length) return '<span class="none">none</span>';
+  return list.map(s =>
+    `<span class="${cls}">${s.name} (${s.turns})</span>`).join(", ");
+}
+
+function render() {
+  const inv = Object.entries(state.inventory);
+  const invText = inv.length
+    ? inv.map(([id, n]) => `${ITEMS[id].name} x${n}`).join(", ")
+    : '<span class="none">empty</span>';
+
+  document.getElementById("sheet").innerHTML = `
+    <div class="row">
+      <span class="stat"><span class="label">HP</span>
+        <span class="hp ${state.hp <= state.maxHp * 0.3 ? "low" : ""}">${state.hp}/${state.maxHp}</span></span>
+      <span class="stat"><span class="label">MP</span>
+        <span class="mp">${state.mp}/${state.maxMp}</span></span>
+      <span class="stat"><span class="label">AP</span>
+        <span class="ap">${state.ap}/${state.maxAp}</span></span>
+      <span class="stat"><span class="label">GOLD</span>
+        <span class="gold">${state.gold}</span></span>
+    </div>
+    <div class="row">
+      <span class="stat"><span class="label">BUFFS</span> ${statusText(state.buffs, "buff")}</span>
+      <span class="stat"><span class="label">DEBUFFS</span> ${statusText(state.debuffs, "debuff")}</span>
+    </div>
+    <div class="row">
+      <span class="stat"><span class="label">CARRYING</span> ${invText}</span>
+    </div>
+  `;
+
+  const buttons = [
+    ["Fight",  "fight",  inCombat],
+    ["Cast",   "cast",   inCombat && state.mp >= SPELLS.ember.cost],
+    ["Talk",   "talk",   inCombat],
+    ["Rest",   "rest",   true],
+    ["Look",   "look",   inCombat],
+    ["Trade",  "trade",  !inCombat],
+    ["Leave",  "leave",  inCombat]
+  ];
+
+  const box = document.getElementById("actions");
+  box.innerHTML = "";
+
+  for (const [label, key, enabled] of buttons) {
+    const b = document.createElement("button");
+    b.textContent = label;
+    b.disabled = over || !enabled;
+    b.addEventListener("click", () => actions[key]());
+    box.appendChild(b);
+  }
+
+  // Inventory gets one button per item held
+  for (const [id, n] of inv) {
+    const b = document.createElement("button");
+    b.textContent = `Use ${ITEMS[id].name} (${n})`;
+    b.disabled = over;
+    b.addEventListener("click", () => actions.use(id));
+    box.appendChild(b);
+  }
+}
+
+/* ==========================================================
+   7. START
+   ========================================================== */
+
+log("A gaunt figure blocks the corridor. It has not moved in some time.", "beat");
+render();
+
+</script>
+</body>
+</html>
