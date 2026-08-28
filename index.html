@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engine test</title>
+<style>
+  :root {
+    --bg:   #12100e;
+    --ink:  #e8e2d6;
+    --dim:  #8a8177;
+    --line: #2e2925;
+    --ok:   #7fb069;
+    --bad:  #c96f5a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 1.25rem;
+    background: var(--bg); color: var(--ink);
+    font: 15px/1.6 ui-monospace, "Cascadia Code", Consolas, monospace;
+  }
+  main { max-width: 42rem; margin: 0 auto; }
+  h1 { font-size: 1rem; font-weight: 500; letter-spacing: .14em;
+       text-transform: uppercase; color: var(--dim); margin: 0 0 1.5rem; }
+
+  #status { color: var(--dim); min-height: 1.6em; }
+
+  /* Download progress. Sits at 0 until the engine reports back. */
+  #bar { height: 3px; background: var(--line); margin: .75rem 0 1.5rem; }
+  #fill { height: 100%; width: 0%; background: var(--ok); transition: width .2s; }
+
+  button {
+    font: inherit; color: var(--bg); background: var(--ink);
+    border: 0; padding: .6rem 1.1rem; cursor: pointer;
+  }
+  button:disabled { background: var(--line); color: var(--dim); cursor: default; }
+  button:focus-visible { outline: 2px solid var(--ok); outline-offset: 2px; }
+
+  section { border-top: 1px solid var(--line); margin-top: 1.75rem; padding-top: 1.25rem; }
+  h2 { font-size: .8rem; font-weight: 500; letter-spacing: .12em;
+       text-transform: uppercase; color: var(--dim); margin: 0 0 .6rem; }
+  pre { white-space: pre-wrap; word-break: break-word; margin: 0; }
+  .ok  { color: var(--ok); }
+  .bad { color: var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Engine test</h1>
+
+  <div id="status">Starting up.</div>
+  <div id="bar"><div id="fill"></div></div>
+
+  <button id="run" disabled>Run the JSON test</button>
+
+  <section>
+    <h2>Raw output</h2>
+    <pre id="raw">Nothing yet.</pre>
+  </section>
+
+  <section>
+    <h2>Parsed</h2>
+    <pre id="parsed">Nothing yet.</pre>
+  </section>
+</main>
+
+<script type="module">
+// The engine is pulled straight from a CDN as an ES module.
+// No npm, no build step, no bundler.
+import { CreateMLCEngine } from "https://esm.run/@mlc-ai/web-llm";
+
+const MODEL = "Llama-3.1-8B-Instruct-q4f16_1-MLC";
+
+const status = document.getElementById("status");
+const fill   = document.getElementById("fill");
+const run    = document.getElementById("run");
+const raw    = document.getElementById("raw");
+const parsed = document.getElementById("parsed");
+
+let engine;
+
+// ---- 1. Load the model -----------------------------------------------
+// First visit downloads several GB. After that it comes from browser
+// storage and takes a few seconds.
+try {
+  engine = await CreateMLCEngine(MODEL, {
+    initProgressCallback: (report) => {
+      status.textContent = report.text;
+      fill.style.width = Math.round((report.progress || 0) * 100) + "%";
+    }
+  });
+  status.textContent = "Model ready.";
+  fill.style.width = "100%";
+  run.disabled = false;
+} catch (err) {
+  status.innerHTML = '<span class="bad">Load failed: ' + err.message + "</span>";
+}
+
+// ---- 2. Ask for JSON and try to parse it -----------------------------
+run.addEventListener("click", async () => {
+  run.disabled = true;
+  status.textContent = "Generating.";
+  raw.textContent = "";
+  parsed.textContent = "";
+
+  const messages = [
+    {
+      role: "system",
+      content:
+        "You are the narrator of a text RPG. Reply with ONLY a JSON object " +
+        "and nothing else. No explanation, no markdown fences. Match this " +
+        'shape exactly: {"narration": "...", "effects": ' +
+        '[{"type": "damage", "amount": 0}]}'
+    },
+    {
+      role: "user",
+      content:
+        "Scene: the player swings a rusted blade at a gaunt figure and connects."
+    }
+  ];
+
+  try {
+    const reply = await engine.chat.completions.create({
+      messages,
+      temperature: 0.8
+    });
+
+    const text = reply.choices[0].message.content;
+    raw.textContent = text;
+
+    // This is the moment that matters. If the model wrapped its answer
+    // in prose or code fences, this throws, and we switch on JSON mode.
+    const obj = JSON.parse(text);
+    parsed.innerHTML =
+      '<span class="ok">Parsed cleanly.</span>\n\n' +
+      "narration: " + obj.narration + "\n" +
+      "effects:   " + JSON.stringify(obj.effects);
+
+    status.textContent = "Done.";
+  } catch (err) {
+    parsed.innerHTML =
+      '<span class="bad">Parse failed: ' + err.message + "</span>";
+    status.textContent = "Done, with a parse failure.";
+  }
+
+  run.disabled = false;
+});
+</script>
+</body>
+</html>
